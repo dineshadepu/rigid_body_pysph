@@ -8,18 +8,27 @@ import numpy as np
 import numpy
 from math import sqrt
 from pysph.sph.equation import Group
-from pysph.sph.scheme import Scheme
-# from pysph.sph.rigid_body_setup import (
-#     setup_rotation_matrix_rigid_body, setup_quaternion_rigid_body,
-#     setup_rotation_matrix_rigid_body_optimized,
-#     setup_quaternion_rigid_body_optimized)
+from pysph.sph.scheme import Scheme, add_bool_argument
+from rigid_body_setup import (
+    set_total_mass,
+    set_center_of_mass,
+    set_moment_of_inertia,
+    set_mi_in_body_frame_quaternion_optimized,
+    set_body_frame_position_vectors,
+    set_body_frame_position_vectors_optimized,
+
+    normalize_R_orientation,
+    normalize_q_orientation,
+    quaternion_to_matrix,
+    quaternion_multiplication)
+
 from compyle.api import (elementwise, annotate, wrap, declare)
 from compyle.low_level import (address)
 from pysph.sph.wc.linalg import (mat_mult, mat_vec_mult, dot)
+from pysph.sph.rigid_body import (BodyForce, RigidBodyCollision)
 from numpy import sin, cos
 
 import numpy as np
-from scipy.spatial.transform import Rotation as Rot
 
 
 class SumUpExternalForces(Equation):
@@ -72,7 +81,7 @@ class SumUpExternalForces(Equation):
             trq[i3+2] += (dx * fy[j] - dy * fx[j])
 
 
-def setup_rigid_body(pa, body_id, principal_moi):
+def setup_rigid_body_unconstrained_dynamics(pa, principal_moi):
     """
     This function will add all the properties regarding unconstrained
     rigid body dynamics.
@@ -83,7 +92,7 @@ def setup_rigid_body(pa, body_id, principal_moi):
     2. using quaternions
     3. Using principal moment of inertia for both dcm and quaternion
     """
-    pa.add_property('body_id', body_id, dtype=int)
+    body_id = pa.body_id
 
     nb = np.max(body_id) + 1
 
@@ -91,441 +100,75 @@ def setup_rigid_body(pa, body_id, principal_moi):
     # Every other rigid body scheme or implementation must
     # have to be based on these following properties
     pa.add_constant("total_mass", np.zeros(nb))
-    pa.add_constant("moib_inv", np.zeros(9*nb))
-    pa.add_constant("moig_inv", np.zeros(9*nb))
-    pa.add_constant("principal_moib_inv", np.zeros(3*nb))
+    # moment of inetria inverse in body frame
+    pa.add_constant("mib", np.zeros(9*nb))
+    # moment of inetria inverse in global frame
+    pa.add_constant("mig", np.zeros(9*nb))
+    # moment of inetria in global frame
+    pa.add_constant("moig", np.zeros(9*nb))
+
+    # moment of inetria inverse in principal body frame
+    pa.add_constant("mibp", np.zeros(3*nb))
 
     pa.add_constant("cm", np.zeros(3*nb))
     pa.add_constant("vc", np.zeros(3*nb))
     pa.add_constant("omega", np.zeros(3*nb))
+    pa.add_constant("ang_mom", np.zeros(3*nb))
     pa.add_constant("force", np.zeros(3*nb))
     pa.add_constant("torque", np.zeros(3*nb))
+
+    pa.add_constant("cm0", np.zeros(3*nb))
+    pa.add_constant("vc0", np.zeros(3*nb))
+    pa.add_constant("omega0", np.zeros(3*nb))
+    pa.add_constant("ang_mom0", np.zeros(3*nb))
+
+    # position of particles in local frame
+    pa.add_property('dx0')
+    pa.add_property('dy0')
+    pa.add_property('dz0')
 
     # total no of rigid bodies
     pa.add_constant("nb", nb)
 
     # if the rigid body uses DCM then we need following property
-    pa.add_constant("R", np.zeros(9*nb))
+    pa.add_constant("R", [1., 0., 0., 0., 1., 0., 0., 0., 1.] * nb)
+    pa.add_constant("R0", [1., 0., 0., 0., 1., 0., 0., 0., 1.] * nb)
 
     # if the rigid body uses quaternion
-    pa.add_constant("q", np.zeros(4*nb))
+    pa.add_constant("q", [1., 0., 0., 0.] * nb)
+    pa.add_constant("q0", [1., 0., 0., 0.] * nb)
 
     # Find total mass
     set_total_mass(pa)
     set_center_of_mass(pa)
     set_moment_of_inertia(pa)
 
-    # set_basic_rigid_body_properties(pa)
+    if principal_moi == True:
+        set_mi_in_body_frame_quaternion_optimized(pa)
+
+    set_body_frame_position_vectors_optimized(pa)
 
 
-def normalize_q_orientation(q):
-    norm_q = np.sqrt(q[0]**2 + q[1]**2 + q[2]**2 + q[3]**2)
-    q[:] = q[:] / norm_q
-
-
-def set_total_mass(pa):
-    # left limit of body i
-    for i in range(max(pa.body_id) + 1):
-        fltr = np.where(pa.body_id == i)
-        pa.total_mass[i] = np.sum(pa.m[fltr])
-        assert pa.total_mass[i] > 0., "Total mass has to be greater than zero"
-
-
-def set_center_of_mass(pa):
-    # loop over all the bodies
-    for i in range(max(pa.body_id) + 1):
-        fltr = np.where(pa.body_id == i)
-        pa.cm[3 * i] = np.sum(pa.m[fltr] * pa.x[fltr]) / pa.total_mass[i]
-        pa.cm[3 * i + 1] = np.sum(pa.m[fltr] * pa.y[fltr]) / pa.total_mass[i]
-        pa.cm[3 * i + 2] = np.sum(pa.m[fltr] * pa.z[fltr]) / pa.total_mass[i]
-
-
-def set_moment_of_inertia(pa):
-    """Compute the moment of inertia at the beginning of the simulation.
-    And set moment of inertia inverse for further computations.
-    This method assumes the center of mass is already computed."""
-    # no of bodies
-    nb = pa.nb[0]
-    # loop over all the bodies
-    for i in range(nb):
-        fltr = np.where(pa.body_id == i)[0]
-        cm_i = pa.cm[3 * i:3 * i + 3]
-
-        I = np.zeros(9)
-        for j in fltr:
-            # Ixx
-            I[0] += pa.m[j] * (
-                (pa.y[j] - cm_i[1])**2. + (pa.z[j] - cm_i[2])**2.)
-
-            # Iyy
-            I[4] += pa.m[j] * (
-                (pa.x[j] - cm_i[0])**2. + (pa.z[j] - cm_i[2])**2.)
-
-            # Izz
-            I[8] += pa.m[j] * (
-                (pa.x[j] - cm_i[0])**2. + (pa.y[j] - cm_i[1])**2.)
-
-            # Ixy
-            I[1] -= pa.m[j] * (pa.x[j] - cm_i[0]) * (pa.y[j] - cm_i[1])
-
-            # Ixz
-            I[2] -= pa.m[j] * (pa.x[j] - cm_i[0]) * (pa.z[j] - cm_i[2])
-
-            # Iyz
-            I[5] -= pa.m[j] * (pa.y[j] - cm_i[1]) * (pa.z[j] - cm_i[2])
-
-        I[3] = I[1]
-        I[6] = I[2]
-        I[7] = I[5]
-        I_inv = np.linalg.inv(I.reshape(3, 3))
-        I_inv = I_inv.ravel()
-        pa.moib_inv[9 * i:9 * i + 9] = I_inv[:]
-
-
-def set_mi_in_body_frame(pa):
-    """Compute the moment of inertia at the beginning of the simulation.
-    And set moment of inertia inverse for further computations.
-    This method assumes the center of mass is already computed."""
-    # no of bodies
-    nb = pa.nb[0]
-    # loop over all the bodies
-    for i in range(nb):
-        fltr = np.where(pa.body_id == i)[0]
-        cm_i = pa.cm[3 * i:3 * i + 3]
-
-        I = np.zeros(9)
-        for j in fltr:
-            # Ixx
-            I[0] += pa.m[j] * (
-                (pa.y[j] - cm_i[1])**2. + (pa.z[j] - cm_i[2])**2.)
-
-            # Iyy
-            I[4] += pa.m[j] * (
-                (pa.x[j] - cm_i[0])**2. + (pa.z[j] - cm_i[2])**2.)
-
-            # Izz
-            I[8] += pa.m[j] * (
-                (pa.x[j] - cm_i[0])**2. + (pa.y[j] - cm_i[1])**2.)
-
-            # Ixy
-            I[1] -= pa.m[j] * (pa.x[j] - cm_i[0]) * (pa.y[j] - cm_i[1])
-
-            # Ixz
-            I[2] -= pa.m[j] * (pa.x[j] - cm_i[0]) * (pa.z[j] - cm_i[2])
-
-            # Iyz
-            I[5] -= pa.m[j] * (pa.y[j] - cm_i[1]) * (pa.z[j] - cm_i[2])
-
-        I[3] = I[1]
-        I[6] = I[2]
-        I[7] = I[5]
-        I_inv = np.linalg.inv(I.reshape(3, 3))
-        I_inv = I_inv.ravel()
-        pa.mib[9 * i:9 * i + 9] = I_inv[:]
-
-
-def set_body_frame_position_vectors(pa):
-    """Save the position vectors w.r.t body frame"""
-    nb = pa.nb[0]
-    # loop over all the bodies
-    for i in range(nb):
-        fltr = np.where(pa.body_id == i)[0]
-        cm_i = pa.cm[3 * i:3 * i + 3]
-        for j in fltr:
-            pa.dx0[j] = pa.x[j] - cm_i[0]
-            pa.dy0[j] = pa.y[j] - cm_i[1]
-            pa.dz0[j] = pa.z[j] - cm_i[2]
-
-
-def set_mi_in_body_frame_rot_mat_optimized(pa):
-    """Compute the moment of inertia at the beginning of the simulation.
-    And set moment of inertia inverse for further computations.
-    This method assumes the center of mass is already computed."""
-    # no of bodies
-    nb = pa.nb[0]
-    # loop over all the bodies
-    for i in range(nb):
-        fltr = np.where(pa.body_id == i)[0]
-        cm_i = pa.cm[3 * i:3 * i + 3]
-
-        I = np.zeros(9)
-        for j in fltr:
-            # Ixx
-            I[0] += pa.m[j] * (
-                (pa.y[j] - cm_i[1])**2. + (pa.z[j] - cm_i[2])**2.)
-
-            # Iyy
-            I[4] += pa.m[j] * (
-                (pa.x[j] - cm_i[0])**2. + (pa.z[j] - cm_i[2])**2.)
-
-            # Izz
-            I[8] += pa.m[j] * (
-                (pa.x[j] - cm_i[0])**2. + (pa.y[j] - cm_i[1])**2.)
-
-            # Ixy
-            I[1] -= pa.m[j] * (pa.x[j] - cm_i[0]) * (pa.y[j] - cm_i[1])
-
-            # Ixz
-            I[2] -= pa.m[j] * (pa.x[j] - cm_i[0]) * (pa.z[j] - cm_i[2])
-
-            # Iyz
-            I[5] -= pa.m[j] * (pa.y[j] - cm_i[1]) * (pa.z[j] - cm_i[2])
-
-        I[3] = I[1]
-        I[6] = I[2]
-        I[7] = I[5]
-        # find the eigen vectors and eigen values of the moi
-        vals, R = np.linalg.eigh(I.reshape(3, 3))
-        # find the determinant of R
-        determinant = np.linalg.det(R)
-        if determinant == -1.:
-            R[:, 0] = -R[:, 0]
-
-        # recompute the moment of inertia about the new coordinate frame
-        # if flipping of one of the axis due the determinant value
-        R = R.ravel()
-
-        if determinant == -1.:
-            I = np.zeros(9)
-            for j in fltr:
-                dx = pa.x[j] - cm_i[0]
-                dy = pa.y[j] - cm_i[1]
-                dz = pa.z[j] - cm_i[2]
-
-                dx0 = (R[0] * dx + R[3] * dy + R[6] * dz)
-                dy0 = (R[1] * dx + R[4] * dy + R[7] * dz)
-                dz0 = (R[2] * dx + R[5] * dy + R[8] * dz)
-
-                # Ixx
-                I[0] += pa.m[j] * (
-                    (dy0)**2. + (dz0)**2.)
-
-                # Iyy
-                I[4] += pa.m[j] * (
-                    (dx0)**2. + (dz0)**2.)
-
-                # Izz
-                I[8] += pa.m[j] * (
-                    (dx0)**2. + (dy0)**2.)
-
-                # Ixy
-                I[1] -= pa.m[j] * (dx0) * (dy0)
-
-                # Ixz
-                I[2] -= pa.m[j] * (dx0) * (dz0)
-
-                # Iyz
-                I[5] -= pa.m[j] * (dy0) * (dz0)
-
-            I[3] = I[1]
-            I[6] = I[2]
-            I[7] = I[5]
-
-            # set the inverse inertia values
-            vals = np.array([I[0], I[4], I[8]])
-
-        pa.mibp[3 * i:3 * i + 3] = 1. / vals
-        pa.R[9 * i:9 * i + 9] = R
-
-
-def rotation_mat_to_quat(R, q):
-    """This code is taken from
-    http://www.euclideanspace.com/maths/geometry/rotations/conversions/matrixToQuaternion/
+def setup_rigid_body_collision_dynamics(pa, rad_s):
     """
-    q[0] = np.sqrt(R[0] + R[4] + R[8]) / 2
-    q[1] = (R[7] - R[5]) / (4. * q[0])
-    q[2] = (R[2] - R[6]) / (4. * q[0])
-    q[3] = (R[3] - R[1]) / (4. * q[0])
+    This function will add all the properties regarding collision of
+    rigid body.
+
+    The following schemes will be implemented
+
+    1. DEM 3d
+    """
+    pa.add_property('fx')
+    pa.add_property('fy')
+    pa.add_property('fz')
+
+    pa.add_property('rad_s')
+    pa.rad_s[:] = rad_s
+
+    pa.add_output_arrays(['fx', 'fy', 'fz'])
 
 
-def set_mi_in_body_frame_quaternion_optimized(pa):
-    """Compute the moment of inertia at the beginning of the simulation.
-    And set moment of inertia inverse for further computations.
-    This method assumes the center of mass is already computed."""
-    # no of bodies
-    nb = pa.nb[0]
-    # loop over all the bodies
-    for i in range(nb):
-        fltr = np.where(pa.body_id == i)[0]
-        cm_i = pa.cm[3 * i:3 * i + 3]
-
-        I = np.zeros(9)
-        for j in fltr:
-            # Ixx
-            I[0] += pa.m[j] * (
-                (pa.y[j] - cm_i[1])**2. + (pa.z[j] - cm_i[2])**2.)
-
-            # Iyy
-            I[4] += pa.m[j] * (
-                (pa.x[j] - cm_i[0])**2. + (pa.z[j] - cm_i[2])**2.)
-
-            # Izz
-            I[8] += pa.m[j] * (
-                (pa.x[j] - cm_i[0])**2. + (pa.y[j] - cm_i[1])**2.)
-
-            # Ixy
-            I[1] -= pa.m[j] * (pa.x[j] - cm_i[0]) * (pa.y[j] - cm_i[1])
-
-            # Ixz
-            I[2] -= pa.m[j] * (pa.x[j] - cm_i[0]) * (pa.z[j] - cm_i[2])
-
-            # Iyz
-            I[5] -= pa.m[j] * (pa.y[j] - cm_i[1]) * (pa.z[j] - cm_i[2])
-
-        I[3] = I[1]
-        I[6] = I[2]
-        I[7] = I[5]
-        # find the eigen vectors and eigen values of the moi
-        vals, R = np.linalg.eigh(I.reshape(3, 3))
-        # find the determinant of R
-        determinant = np.linalg.det(R)
-        if determinant == -1.:
-            R[:, 0] = -R[:, 0]
-
-        # recompute the moment of inertia about the new coordinate frame
-        # if flipping of one of the axis due the determinant value
-        R = R.ravel()
-
-        if determinant == -1.:
-            I = np.zeros(9)
-            for j in fltr:
-                dx = pa.x[j] - cm_i[0]
-                dy = pa.y[j] - cm_i[1]
-                dz = pa.z[j] - cm_i[2]
-
-                dx0 = (R[0] * dx + R[3] * dy + R[6] * dz)
-                dy0 = (R[1] * dx + R[4] * dy + R[7] * dz)
-                dz0 = (R[2] * dx + R[5] * dy + R[8] * dz)
-
-                # Ixx
-                I[0] += pa.m[j] * (
-                    (dy0)**2. + (dz0)**2.)
-
-                # Iyy
-                I[4] += pa.m[j] * (
-                    (dx0)**2. + (dz0)**2.)
-
-                # Izz
-                I[8] += pa.m[j] * (
-                    (dx0)**2. + (dy0)**2.)
-
-                # Ixy
-                I[1] -= pa.m[j] * (dx0) * (dy0)
-
-                # Ixz
-                I[2] -= pa.m[j] * (dx0) * (dz0)
-
-                # Iyz
-                I[5] -= pa.m[j] * (dy0) * (dz0)
-
-            I[3] = I[1]
-            I[6] = I[2]
-            I[7] = I[5]
-
-            # set the inverse inertia values
-            vals = np.array([I[0], I[4], I[8]])
-
-        pa.mibp[3 * i:3 * i + 3] = 1. / vals
-
-        # get the quaternion from the rotation matrix
-        r = Rot.from_dcm(R.reshape(3, 3))
-        q_tmp = r.as_quat()
-        q = np.zeros(4)
-        q[0] = q_tmp[3]
-        q[1] = q_tmp[0]
-        q[2] = q_tmp[1]
-        q[3] = q_tmp[2]
-
-        normalize_q_orientation(q)
-        pa.q[4 * i:4 * i + 4] = q
-
-        # also set the rotation matrix
-        pa.R[9 * i:9 * i + 9] = R
-
-
-def set_body_frame_position_vectors_optimized(pa):
-    """Save the position vectors w.r.t body frame"""
-    nb = pa.nb[0]
-    # loop over all the bodies
-    for i in range(nb):
-        fltr = np.where(pa.body_id == i)[0]
-        cm_i = pa.cm[3 * i:3 * i + 3]
-        R_i = pa.R[9 * i:9 * i + 9]
-        for j in fltr:
-            dx = pa.x[j] - cm_i[0]
-            dy = pa.y[j] - cm_i[1]
-            dz = pa.z[j] - cm_i[2]
-
-            pa.dx0[j] = (R_i[0] * dx + R_i[3] * dy + R_i[6] * dz)
-            pa.dy0[j] = (R_i[1] * dx + R_i[4] * dy + R_i[7] * dz)
-            pa.dz0[j] = (R_i[2] * dx + R_i[5] * dy + R_i[8] * dz)
-
-
-def setup_rotation_matrix_rigid_body(pa):
-    """Setup total mass, center of mass, moment of inertia and
-    angular momentum of a rigid body defined using rotation matrices."""
-    set_total_mass(pa)
-    set_center_of_mass(pa)
-    set_mi_in_body_frame(pa)
-    set_body_frame_position_vectors(pa)
-
-
-def setup_quaternion_rigid_body(pa):
-    """Setup total mass, center of mass, moment of inertia and
-    angular momentum of a rigid body defined using quaternion."""
-    set_total_mass(pa)
-    set_center_of_mass(pa)
-    set_mi_in_body_frame(pa)
-    set_body_frame_position_vectors(pa)
-
-
-def setup_rotation_matrix_rigid_body_optimized(pa):
-    """Setup total mass, center of mass, moment of inertia and
-    angular momentum of a rigid body defined using rotation matrices."""
-    set_total_mass(pa)
-    set_center_of_mass(pa)
-    set_mi_in_body_frame_rot_mat_optimized(pa)
-    set_body_frame_position_vectors_optimized(pa)
-
-
-def setup_quaternion_rigid_body_optimized(pa):
-    """Setup total mass, center of mass, moment of inertia and
-    angular momentum of a rigid body defined using rotation matrices."""
-    set_total_mass(pa)
-    set_center_of_mass(pa)
-    set_mi_in_body_frame_quaternion_optimized(pa)
-    set_body_frame_position_vectors_optimized(pa)
-
-
-def normalize_R_orientation(orien):
-    a1 = np.array([orien[0], orien[3], orien[6]])
-    a2 = np.array([orien[1], orien[4], orien[7]])
-    a3 = np.array([orien[2], orien[5], orien[8]])
-    # norm of col0
-    na1 = np.linalg.norm(a1)
-
-    b1 = a1 / na1
-
-    b2 = a2 - np.dot(b1, a2) * b1
-    nb2 = np.linalg.norm(b2)
-    b2 = b2 / nb2
-
-    b3 = a3 - np.dot(b1, a3) * b1 - np.dot(b2, a3) * b2
-    nb3 = np.linalg.norm(b3)
-    b3 = b3 / nb3
-
-    orien[0] = b1[0]
-    orien[3] = b1[1]
-    orien[6] = b1[2]
-    orien[1] = b2[0]
-    orien[4] = b2[1]
-    orien[7] = b2[2]
-    orien[2] = b3[0]
-    orien[5] = b3[1]
-    orien[8] = b3[2]
-
-
-class RK2StepRigidBodyDCM(IntegratorStep):
+class RK2StepRigidBodyRotationMatrices(IntegratorStep):
     def py_initialize(self, dst, t, dt):
         for i in range(dst.nb[0]):
             for j in range(3):
@@ -534,8 +177,8 @@ class RK2StepRigidBodyDCM(IntegratorStep):
                 dst.vc0[3*i+j] = dst.vc[3*i+j]
 
                 # save the current angular momentum
-                # dst.L0[j] = dst.L[j]
-                dst.omega0[3*i+j] = dst.omega[3*i+j]
+                dst.ang_mom0[3*i+j] = dst.ang_mom[3*i+j]
+                # dst.omega0[3*i+j] = dst.omega[3*i+j]
 
             # save the current orientation
             for j in range(9):
@@ -577,13 +220,13 @@ class RK2StepRigidBodyDCM(IntegratorStep):
             R_t = R.transpose()
             tmp = np.matmul(R, dst.mib[i9:i9+9].reshape(3, 3))
             dst.mig[i9:i9+9] = (np.matmul(tmp, R_t)).ravel()[:]
-            # move angular velocity to t + dt/2.
-            # omega_dot is
-            tmp = dst.torque[i3:i3+3] - np.cross(
-                dst.omega[i3:i3+3], np.matmul(dst.mig[i9:i9+9].reshape(3, 3),
-                                              dst.omega[i3:i3+3]))
-            omega_dot = np.matmul(dst.mig[i9:i9+9].reshape(3, 3), tmp)
-            dst.omega[i3:i3+3] = dst.omega0[i3:i3+3] + omega_dot * dtb2
+            # move angular momentum to t + dt/2.
+            dst.ang_mom[i3:i3+3] = dst.ang_mom0[i3:i3+3] + dst.torque[i3:i3+3] * dtb2
+
+            tmp = dst.ang_mom[i3:i3+3]
+
+            omega = np.matmul(dst.mig[i9:i9+9].reshape(3, 3), tmp)
+            dst.omega[i3:i3+3] = omega[:]
 
     def stage1(self, d_idx, d_x, d_y, d_z, d_u, d_v, d_w, d_dx0, d_dy0, d_dz0,
                d_cm, d_vc, d_R, d_omega, d_body_id):
@@ -654,13 +297,13 @@ class RK2StepRigidBodyDCM(IntegratorStep):
             R_t = R.transpose()
             tmp = np.matmul(R, dst.mib[i9:i9+9].reshape(3, 3))
             dst.mig[i9:i9+9] = (np.matmul(tmp, R_t)).ravel()[:]
-            # move angular velocity to t + dt
-            # omega_dot is
-            tmp = dst.torque[i3:i3+3] - np.cross(
-                dst.omega[i3:i3+3], np.matmul(dst.mig[i9:i9+9].reshape(3, 3),
-                                              dst.omega[i3:i3+3]))
-            omega_dot = np.matmul(dst.mig[i9:i9+9].reshape(3, 3), tmp)
-            dst.omega[i3:i3+3] = dst.omega0[i3:i3+3] + omega_dot * dt
+            # move angular momentum to t + dt/2.
+            dst.ang_mom[i3:i3+3] = dst.ang_mom0[i3:i3+3] + dst.torque[i3:i3+3] * dt
+
+            tmp = dst.ang_mom[i3:i3+3]
+
+            omega = np.matmul(dst.mig[i9:i9+9].reshape(3, 3), tmp)
+            dst.omega[i3:i3+3] = omega[:]
 
     def stage2(self, d_idx, d_x, d_y, d_z, d_u, d_v, d_w, d_dx0, d_dy0, d_dz0,
                d_cm, d_vc, d_R, d_omega, d_body_id):
@@ -700,57 +343,7 @@ class RK2StepRigidBodyDCM(IntegratorStep):
         d_w[d_idx] = d_vc[i3+2] + dw
 
 
-def normalize_q_orientation(q):
-    norm_q = sqrt(q[0]**2 + q[1]**2 + q[2]**2 + q[3]**2)
-    q[:] = q[:] / norm_q
-
-
-def quaternion_multiplication(p, q, res):
-    """Parameters
-    ----------
-    p   : [float]
-          An array of length four
-    q   : [float]
-          An array of length four
-    res : [float]
-          An array of length four
-    Here `p` is a quaternion. i.e., p = [p.w, p.x, p.y, p.z]. And q is an
-    another quaternion.
-    This function is used to compute the rate of change of orientation
-    when orientation is represented in terms of a quaternion. When the
-    angular velocity is represented in terms of global frame
-    \frac{dq}{dt} = \frac{1}{2} omega q
-    http://www.ams.stonybrook.edu/~coutsias/papers/rrr.pdf
-    see equation 8
-    """
-    res[0] = (p[0] * q[0] - p[1] * q[1] - p[2] * q[2] - p[3] * q[3])
-    res[1] = (p[0] * q[1] + q[0] * p[1] + p[2] * q[3] - p[3] * q[2])
-    res[2] = (p[0] * q[2] + q[0] * p[2] + p[3] * q[1] - p[1] * q[3])
-    res[3] = (p[0] * q[3] + q[0] * p[3] + p[1] * q[2] - p[2] * q[1])
-
-
-def scale_quaternion(q, scale):
-    q[0] = q[0] * scale
-    q[1] = q[1] * scale
-    q[2] = q[2] * scale
-    q[3] = q[3] * scale
-
-
-def quaternion_to_matrix(q, matrix):
-    matrix[0] = 1. - 2. * (q[2]**2. + q[3]**2.)
-    matrix[1] = 2. * (q[1] * q[2] - q[0] * q[3])
-    matrix[2] = 2. * (q[1] * q[3] + q[0] * q[2])
-
-    matrix[3] = 2. * (q[1] * q[2] + q[0] * q[3])
-    matrix[4] = 1. - 2. * (q[1]**2. + q[3]**2.)
-    matrix[5] = 2. * (q[2] * q[3] - q[0] * q[1])
-
-    matrix[6] = 2. * (q[1] * q[3] - q[0] * q[2])
-    matrix[7] = 2. * (q[2] * q[3] + q[0] * q[1])
-    matrix[8] = 1. - 2. * (q[1]**2. + q[2]**2.)
-
-
-class RK2StepRigidBodyQuaternions(RK2StepRigidBodyDCM):
+class RK2StepRigidBodyQuaternions(RK2StepRigidBodyRotationMatrices):
     def py_initialize(self, dst, t, dt):
         for i in range(dst.nb[0]):
             for j in range(3):
@@ -758,7 +351,9 @@ class RK2StepRigidBodyQuaternions(RK2StepRigidBodyDCM):
                 dst.cm0[3*i+j] = dst.cm[3*i+j]
                 dst.vc0[3*i+j] = dst.vc[3*i+j]
 
-                dst.omega0[3*i+j] = dst.omega[3*i+j]
+                # save the current angular momentum
+                dst.ang_mom0[3*i+j] = dst.ang_mom[3*i+j]
+                # dst.omega0[3*i+j] = dst.omega[3*i+j]
 
             # save the current orientation
             for j in range(4):
@@ -805,13 +400,13 @@ class RK2StepRigidBodyQuaternions(RK2StepRigidBodyDCM):
             R_t = R.T
             tmp = np.matmul(R, dst.mib[i9:i9+9].reshape(3, 3))
             dst.mig[i9:i9+9] = (np.matmul(tmp, R_t)).ravel()
-            # move angular velocity to t + dt/2.
-            # omega_dot is
-            tmp = dst.torque[i3:i3+3] - np.cross(
-                dst.omega[i3:i3+3], np.matmul(dst.mig[i9:i9+9].reshape(3, 3),
-                                              dst.omega[i3:i3+3]))
-            omega_dot = np.matmul(dst.mig[i9:i9+9].reshape(3, 3), tmp)
-            dst.omega[i3:i3+3] = dst.omega0[i3:i3+3] + omega_dot * dtb2
+            # move angular momentum to t + dt/2.
+            dst.ang_mom[i3:i3+3] = dst.ang_mom0[i3:i3+3] + dst.torque[i3:i3+3] * dtb2
+
+            tmp = dst.ang_mom[i3:i3+3]
+
+            omega = np.matmul(dst.mig[i9:i9+9].reshape(3, 3), tmp)
+            dst.omega[i3:i3+3] = omega[:]
 
     def py_stage2(self, dst, t, dt):
         for i in range(dst.nb[0]):
@@ -850,16 +445,31 @@ class RK2StepRigidBodyQuaternions(RK2StepRigidBodyDCM):
             R_t = R.T
             tmp = np.matmul(R, dst.mib[i9:i9+9].reshape(3, 3))
             dst.mig[i9:i9+9] = (np.matmul(tmp, R_t)).ravel()
-            # move angular velocity to t + dt
-            # omega_dot is
-            tmp = dst.torque[i3:i3+3] - np.cross(
-                dst.omega[i3:i3+3], np.matmul(dst.mig[i9:i9+9].reshape(3, 3),
-                                              dst.omega[i3:i3+3]))
-            omega_dot = np.matmul(dst.mig[i9:i9+9].reshape(3, 3), tmp)
-            dst.omega[i3:i3+3] = dst.omega0[i3:i3+3] + omega_dot * dt
+            # move angular momentum to t + dt/2.
+            dst.ang_mom[i3:i3+3] = dst.ang_mom0[i3:i3+3] + dst.torque[i3:i3+3] * dt
+
+            tmp = dst.ang_mom[i3:i3+3]
+
+            omega = np.matmul(dst.mig[i9:i9+9].reshape(3, 3), tmp)
+            dst.omega[i3:i3+3] = omega[:]
 
 
-class RK2StepRigidBodyRotationMatricesOptimized(RK2StepRigidBodyDCM):
+class RK2StepRigidBodyRotationMatricesOptimized(RK2StepRigidBodyRotationMatrices):
+    def py_initialize(self, dst, t, dt):
+        for i in range(dst.nb[0]):
+            for j in range(3):
+                # save the center of mass and center of mass velocity
+                dst.cm0[3*i+j] = dst.cm[3*i+j]
+                dst.vc0[3*i+j] = dst.vc[3*i+j]
+
+                # save the current angular momentum
+                # dst.ang_mom0[3*i+j] = dst.ang_mom[3*i+j]
+                dst.omega0[3*i+j] = dst.omega[3*i+j]
+
+            # save the current orientation
+            for j in range(9):
+                dst.R0[9*i+j] = dst.R[9*i+j]
+
     def py_stage1(self, dst, t, dt):
         dtb2 = dt / 2.
         for i in range(dst.nb[0]):
@@ -957,6 +567,21 @@ class RK2StepRigidBodyRotationMatricesOptimized(RK2StepRigidBodyDCM):
 
 
 class RK2StepRigidBodyQuaternionsOptimized(RK2StepRigidBodyQuaternions):
+    def py_initialize(self, dst, t, dt):
+        for i in range(dst.nb[0]):
+            for j in range(3):
+                # save the center of mass and center of mass velocity
+                dst.cm0[3*i+j] = dst.cm[3*i+j]
+                dst.vc0[3*i+j] = dst.vc[3*i+j]
+
+                # save the current angular momentum
+                # dst.ang_mom0[3*i+j] = dst.ang_mom[3*i+j]
+                dst.omega0[3*i+j] = dst.omega[3*i+j]
+
+            # save the current orientation
+            for j in range(4):
+                dst.q0[4*i+j] = dst.q[4*i+j]
+
     def py_stage1(self, dst, t, dt):
         dtb2 = dt / 2.
         for i in range(dst.nb[0]):
@@ -1071,3 +696,108 @@ class RK2StepRigidBodyQuaternionsOptimized(RK2StepRigidBodyQuaternions):
 
             # get the rotation matrix from quaternion
             quaternion_to_matrix(dst.q[i4:i4+4], dst.R[i9:i9+9])
+
+
+class RigidBodyScheme(Scheme):
+    def __init__(self, rigid_bodies, boundaries, dim, orientation, principal_moi, kn,
+                 mu=0.5, en=1.0, gx=0.0, gy=0.0, gz=0.0,
+                 debug=False):
+        self.rigid_bodies = rigid_bodies
+        self.boundaries = boundaries
+        self.dim = dim
+        self.orientation = orientation
+        self.principal_moi = principal_moi
+        self.kn = kn
+        self.mu = mu
+        self.en = en
+        self.gx = gx
+        self.gy = gy
+        self.gz = gz
+        self.debug = debug
+
+    def setup_properties(self, particles, clean=True):
+        rigid_body_names = self.rigid_bodies
+        rigid_body_arrays = []
+        for pa_array in particles:
+            if pa_array.name in rigid_body_names:
+                setup_rigid_body_unconstrained_dynamics(pa_array,
+                                                        principal_moi=self.principal_moi)
+
+    def add_user_options(self, group):
+        group.add_argument(
+            "--orientation", action="store", dest="orientation",
+            default="DCM",
+            type=str,
+            help="Orientation of rigid body"
+        )
+
+        add_bool_argument(
+            group, 'principal_moi', dest='principal_moi', default=False,
+            help='Use principal moment of inertia'
+        )
+
+    def consume_user_options(self, options):
+        _vars = ['orientation']
+        data = dict((var, self._smart_getattr(options, var))
+                    for var in _vars)
+        self.configure(**data)
+
+    def configure_solver(self, kernel=None, integrator_cls=None,
+                         extra_steppers=None, **kw):
+        from pysph.base.kernels import CubicSpline
+        from pysph.sph.integrator import EPECIntegrator
+        from pysph.solver.solver import Solver
+        if kernel is None:
+            kernel = CubicSpline(dim=self.dim)
+
+        steppers = {}
+        if extra_steppers is not None:
+            steppers.update(extra_steppers)
+
+        for body in self.rigid_bodies:
+            if body not in steppers:
+                if self.orientation == "quaternion" and self.principal_moi == True:
+                    steppers[body] = RK2StepRigidBodyQuaternionsOptimized()
+
+                if self.orientation == "quaternion" and self.principal_moi == False:
+                    steppers[body] = RK2StepRigidBodyQuaternions()
+
+                if self.orientation == "DCM" and self.principal_moi == True:
+                    steppers[body] = RK2StepRigidBodyRotationMatricesOptimized()
+
+                if self.orientation == "DCM" and self.principal_moi == False:
+                    steppers[body] = RK2StepRigidBodyRotationMatrices()
+
+        cls = integrator_cls if integrator_cls is not None else EPECIntegrator
+        integrator = cls(**steppers)
+
+        self.solver = Solver(dim=self.dim, integrator=integrator,
+                             kernel=kernel, **kw)
+
+    def get_equations(self):
+        equations = []
+        g1 = []
+        if self.boundaries is not None:
+            all = self.rigid_bodies + self.boundaries
+        else:
+            all = self.rigid_bodies
+
+        for name in self.rigid_bodies:
+            g1.append(
+                BodyForce(dest=name, sources=None, gx=self.gx, gy=self.gy,
+                          gz=self.gz))
+        equations.append(Group(equations=g1, real=False))
+
+        g2 = []
+        for name in self.rigid_bodies:
+            g2.append(
+                RigidBodyCollision(dest=name, sources=all, kn=self.kn,
+                                   mu=self.mu, en=self.en))
+        equations.append(Group(equations=g2, real=False))
+
+        g3 = []
+        for name in self.rigid_bodies:
+            g3.append(SumUpExternalForces(dest=name, sources=None))
+        equations.append(Group(equations=g3, real=False))
+
+        return equations
