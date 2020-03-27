@@ -13,9 +13,8 @@ from rigid_body_setup import (
     set_total_mass,
     set_center_of_mass,
     set_moment_of_inertia,
-    set_mi_in_body_frame_quaternion_optimized,
+    set_mi_in_body_frame_optimized,
     set_body_frame_position_vectors,
-    set_body_frame_position_vectors_optimized,
 
     normalize_R_orientation,
     normalize_q_orientation,
@@ -144,9 +143,9 @@ def setup_rigid_body_unconstrained_dynamics(pa, principal_moi):
     set_moment_of_inertia(pa)
 
     if principal_moi == True:
-        set_mi_in_body_frame_quaternion_optimized(pa)
+        set_mi_in_body_frame_optimized(pa)
 
-    set_body_frame_position_vectors_optimized(pa)
+    set_body_frame_position_vectors(pa)
 
 
 def setup_rigid_body_collision_dynamics(pa, rad_s):
@@ -737,7 +736,7 @@ class RigidBodyScheme(Scheme):
         )
 
     def consume_user_options(self, options):
-        _vars = ['orientation']
+        _vars = ['orientation', 'principal_moi']
         data = dict((var, self._smart_getattr(options, var))
                     for var in _vars)
         self.configure(**data)
