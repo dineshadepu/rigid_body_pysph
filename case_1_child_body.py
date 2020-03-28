@@ -137,7 +137,7 @@ class Case1(Application):
             ],
             ),
             Group(equations=[
-                SumUpExternalForces(dest='child_body', sources=None)
+                SumUpExternalForcesChild(dest='child_body', sources=None)
             ],)]
         return equations
 
