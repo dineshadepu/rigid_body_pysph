@@ -167,6 +167,78 @@ def setup_rigid_body_collision_dynamics(pa, rad_s):
     pa.add_output_arrays(['fx', 'fy', 'fz'])
 
 
+def setup_child_body(child_body, body):
+    body_id = child_body.body_id
+
+    nb = np.max(body_id) + 1
+    # total no of rigid bodies
+    child_body.add_constant("nb", nb)
+
+
+    # position of particles in local frame
+    child_body.add_property('dx0')
+    child_body.add_property('dy0')
+    child_body.add_property('dz0')
+
+
+    child_body.constants['total_mass'] = body.constants['total_mass']
+    child_body.constants['cm'] = body.constants['cm']
+    child_body.constants['vc'] = body.constants['vc']
+    child_body.constants['R'] = body.constants['R']
+    child_body.constants['omega'] = body.constants['omega']
+    child_body.constants['force'] = body.constants['force']
+    child_body.constants['torque'] = body.constants['torque']
+
+    set_body_frame_position_vectors(child_body)
+
+
+class SumUpExternalForcesChild(Equation):
+    def reduce(self, dst, t, dt):
+        frc = declare('object')
+        trq = declare('object')
+        fx = declare('object')
+        fy = declare('object')
+        fz = declare('object')
+        x = declare('object')
+        y = declare('object')
+        z = declare('object')
+        cm = declare('object')
+        body_id = declare('object')
+        j = declare('int')
+        i = declare('int')
+        i3 = declare('int')
+
+        frc = dst.force
+        trq = dst.torque
+        fx = dst.fx
+        fy = dst.fy
+        fz = dst.fz
+        x = dst.x
+        y = dst.y
+        z = dst.z
+        cm = dst.cm
+        body_id = dst.body_id
+
+        for j in range(len(x)):
+            i = body_id[j]
+            i3 = 3 * i
+            frc[i3] += fx[j]
+            frc[i3+1] += fy[j]
+            frc[i3+2] += fz[j]
+
+            # torque due to force on particle i
+            # (r_i - com) \cross f_i
+            dx = x[j] - cm[i3]
+            dy = y[j] - cm[i3+1]
+            dz = z[j] - cm[i3+2]
+
+            # torque due to force on particle i
+            # dri \cross fi
+            trq[i3] += (dy * fz[j] - dz * fy[j])
+            trq[i3+1] += (dz * fx[j] - dx * fz[j])
+            trq[i3+2] += (dx * fy[j] - dy * fx[j])
+
+
 class RK2StepRigidBodyRotationMatrices(IntegratorStep):
     def py_initialize(self, dst, t, dt):
         for i in range(dst.nb[0]):
@@ -697,12 +769,24 @@ class RK2StepRigidBodyQuaternionsOptimized(RK2StepRigidBodyQuaternions):
             quaternion_to_matrix(dst.q[i4:i4+4], dst.R[i9:i9+9])
 
 
+class ChildBodyStep(RK2StepRigidBodyRotationMatrices):
+    def py_initialize(self, dst, t, dt):
+        pass
+
+    def py_stage1(self, dst, t, dt):
+        pass
+
+    def py_stage2(self, dst, t, dt):
+        pass
+
+
 class RigidBodyScheme(Scheme):
     def __init__(self, rigid_bodies, boundaries, dim, orientation, principal_moi, kn,
-                 mu=0.5, en=1.0, gx=0.0, gy=0.0, gz=0.0,
+                 child_rigid_bodies=None, mu=0.5, en=1.0, gx=0.0, gy=0.0, gz=0.0,
                  debug=False):
         self.rigid_bodies = rigid_bodies
         self.boundaries = boundaries
+        self.child_rigid_bodies = child_rigid_bodies
         self.dim = dim
         self.orientation = orientation
         self.principal_moi = principal_moi
@@ -753,7 +837,8 @@ class RigidBodyScheme(Scheme):
         if extra_steppers is not None:
             steppers.update(extra_steppers)
 
-        for body in self.rigid_bodies:
+        rigid_bodies = self.rigid_bodies
+        for body in rigid_bodies:
             if body not in steppers:
                 if self.orientation == "quaternion" and self.principal_moi == True:
                     steppers[body] = RK2StepRigidBodyQuaternionsOptimized()
@@ -766,6 +851,14 @@ class RigidBodyScheme(Scheme):
 
                 if self.orientation == "DCM" and self.principal_moi == False:
                     steppers[body] = RK2StepRigidBodyRotationMatrices()
+
+
+        if self.child_rigid_bodies is not None:
+            child_rigid_bodies = self.child_rigid_bodies
+            for body in child_rigid_bodies:
+                if body not in steppers:
+                    steppers[body] = ChildBodyStep()
+
 
         cls = integrator_cls if integrator_cls is not None else EPECIntegrator
         integrator = cls(**steppers)
@@ -781,6 +874,9 @@ class RigidBodyScheme(Scheme):
         else:
             all = self.rigid_bodies
 
+        if self.child_rigid_bodies is not None:
+            all = all + self.child_rigid_bodies
+
         for name in self.rigid_bodies:
             g1.append(
                 BodyForce(dest=name, sources=None, gx=self.gx, gy=self.gy,
@@ -788,7 +884,12 @@ class RigidBodyScheme(Scheme):
         equations.append(Group(equations=g1, real=False))
 
         g2 = []
-        for name in self.rigid_bodies:
+        if self.child_rigid_bodies is not None:
+            rigid_bodies = self.rigid_bodies + self.child_rigid_bodies
+        else:
+            rigid_bodies = self.rigid_bodies
+
+        for name in rigid_bodies:
             g2.append(
                 RigidBodyCollision(dest=name, sources=all, kn=self.kn,
                                    mu=self.mu, en=self.en))
@@ -798,5 +899,12 @@ class RigidBodyScheme(Scheme):
         for name in self.rigid_bodies:
             g3.append(SumUpExternalForces(dest=name, sources=None))
         equations.append(Group(equations=g3, real=False))
+
+        g4 = []
+        if self.child_rigid_bodies is not None:
+            for name in self.child_rigid_bodies:
+                g4.append(SumUpExternalForces(dest=name, sources=None))
+
+            equations.append(Group(equations=g4, real=False))
 
         return equations

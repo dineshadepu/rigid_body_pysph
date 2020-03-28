@@ -61,9 +61,9 @@ class Case1(Application):
     def create_particles(self):
         nx, ny, nz = 10, 10, 10
         dx = self.dx
-        x, y, z = create_an_unsymmetric_body(self.dx * 2., 0.5, 0.5, 1.)
+        # x, y, z = create_an_unsymmetric_body(self.dx * 2., 0.5, 0.5, 1.)
 
-        # x, y, z = np.mgrid[0:1:nx * 1j, 0:1:ny * 1j, 0:1:nz * 1j]
+        x, y, z = np.mgrid[0:1:nx * 1j, 0:1:ny * 1j, 0:1:nz * 1j]
         x = x.flat
         y = y.flat
         z = z.flat
