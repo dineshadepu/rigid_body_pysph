@@ -1,0 +1,178 @@
+\documentclass[preprint,12pt]{elsarticle}
+% \documentclass[draft,12pt]{elsarticle}
+
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{amssymb}
+\usepackage{amsmath}
+\usepackage{multirow}
+\usepackage{relsize}
+\usepackage[utf8]{inputenc}
+\usepackage{cleveref}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage[section]{placeins}
+\usepackage{booktabs}
+\usepackage{url}
+
+% For the TODOs
+\usepackage{xcolor}
+\usepackage{xargs}
+\usepackage[colorinlistoftodos,textsize=footnotesize]{todonotes}
+\newcommand{\todoin}{\todo[inline]}
+% from here: https://tex.stackexchange.com/questions/9796/how-to-add-todo-notes
+\newcommandx{\unsure}[2][1=]{\todo[linecolor=red,backgroundcolor=red!25,bordercolor=red,#1]{#2}}
+\newcommandx{\change}[2][1=]{\todo[linecolor=blue,backgroundcolor=blue!25,bordercolor=blue,#1]{#2}}
+\newcommandx{\info}[2][1=]{\todo[linecolor=OliveGreen,backgroundcolor=OliveGreen!25,bordercolor=OliveGreen,#1]{#2}}
+
+%Boldtype for greek symbols
+\newcommand{\teng}[1]{\ensuremath{\boldsymbol{#1}}}
+\newcommand{\ten}[1]{\ensuremath{\mathbf{#1}}}
+
+\usepackage{lineno}
+% \linenumbers
+
+\journal{}
+
+\begin{document}
+
+\begin{frontmatter}
+
+  \title{}
+  \author[XXX]{Dinesh Adepu\corref{cor1}}
+  \ead{d.dinesh@surrey.ac.uk}
+  \author[XXX]{Pawan Negi \corref{cor1}}
+  \ead{xxx}
+  \author[University of Surrey]{Chuan Yu Wu}
+  \ead{XXX}
+\address[xxx]{xxx}
+
+\cortext[cor1]{Corresponding author}
+
+
+\begin{abstract}
+\end{abstract}
+
+\begin{keyword}
+%% keywords here, in the form: keyword \sep keyword
+{xxx}, {xxx}, {xxx}
+
+%% MSC codes here, in the form: \MSC code \sep code
+%% or \MSC[2008] code \sep code (2000 is the default)
+
+\end{keyword}
+
+\end{frontmatter}
+
+% \linenumbers
+
+
+\FloatBarrier%
+\section{Introduction}
+\label{sec:conclusions}
+Lethe DEM has given benchmarks required to validate our DEM solver.
+
+
+
+\FloatBarrier%
+\section{Rigid body dynamics 2D}
+\label{sec:rb_2d}
+
+% Taken from the appendix of \cite{dietemann2020smoothed}
+Linear velocity and center of mass is updated as
+
+
+\begin{equation}
+  \label{eq:rfc:lin_vel_cm_update}
+  \ten{v}_{cm}^{n+1} = \ten{v}_{cm}^{n} + \frac{\ten{F}_{cm}}{M} \; \Delta t,
+\end{equation}
+
+\begin{equation}
+  \label{eq:rfc:lin_pos_cm_update}
+  \ten{x}_{cm}^{n+1} = \ten{x}_{cm}^{n} + \ten{v}_{cm}^{n} \; \Delta t,\\
+\end{equation}
+
+
+The rotation part is updated as
+
+
+\begin{equation}
+  \label{eq:rfc:lin_vel_cm_update}
+  \omega^{n+1} = \omega^{n} +  + \frac{T_{cm}}{I_{zz}} \; \Delta t
+\end{equation}
+
+\begin{equation}
+  \label{eq:rfc:lin_vel_cm_update}
+  \ten{\phi}^{n+1} = \ten{\phi}^{n} + \omega \; \Delta t
+\end{equation}
+
+Based on the angle, the rotation matrix is updated as
+
+\begin{equation}
+  R =
+\begin{pmatrix}
+    \cos(\phi) & -\sin(\phi) & 0 \\
+   \sin(\phi)  & \cos(\phi) & 0 \\
+    0 & 0 & 1
+\end{pmatrix}
+\end{equation}
+
+
+
+
+
+
+\FloatBarrier%
+\subsection{Freely tranlating and rotating rigid body}
+\label{sec:rb_2d}
+
+
+\FloatBarrier%
+\section{Rigid body dynamics 3D}
+\label{sec:rb_3d}
+
+% Taken from the appendix of \cite{dietemann2020smoothed},
+% \cite{coutsias2004quaternions}, discusses body frame quaternion change
+% equation.
+
+
+\FloatBarrier%
+\section{Conclusions}
+\label{sec:conclusions}
+
+
+% \section*{References}
+
+
+\bibliographystyle{model6-num-names}
+\bibliography{references}
+\end{document}
+
+% ============================
+% Table template for reference
+% ============================
+% \begin{table}[!ht]
+%   \centering
+%   \begin{tabular}[!ht]{ll}
+%     \toprule
+%     Quantity & Values\\
+%     \midrule
+%     $L$, length of the domain & 1 m \\
+%     Time of simulation & 2.5 s \\
+%     $c_s$ & 10 m/s \\
+%     $\rho_0$, reference density & 1 kg/m\textsuperscript{3} \\
+%     Reynolds number & 200 \& 1000 \\
+%     Resolution, $L/\Delta x_{\max} : L/\Delta x_{\min}$ & $[100:200]$ \& $[150:300]$\\
+%     Smoothing length factor, $h/\Delta x$ & 1.0\\
+%     \bottomrule
+%   \end{tabular}
+%   \caption{Parameters used for the Taylor-Green vortex problem.}%
+%   \label{tab:tgv-params}
+% \end{table}
+
+%%% Local Variables:
+%%% mode: latex
+%%% TeX-master: "paper"
+%%% fill-column: 78
+%%% End:
